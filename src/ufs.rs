@@ -1,7 +1,7 @@
 use std::{
 	ffi::{c_int, OsStr, OsString},
 	io::{Cursor, Error as IoError, ErrorKind, Read, Result as IoResult, Seek, SeekFrom},
-	mem::size_of,
+	mem::{size_of, size_of_val},
 	num::NonZeroU64,
 	os::unix::ffi::{OsStrExt, OsStringExt},
 	path::Path,
@@ -361,25 +361,38 @@ fn readdir_block<T>(
 	let mut file = Decoder::new(file, config);
 
 	loop {
-		let Ok(ino) = file.decode::<InodeNum>() else {
+		let Ok(ent) = file.decode::<DirentHeader>() else {
 			break;
 		};
-		if ino == 0 {
+		if ent.inr == 0 {
 			break;
 		}
-
-		let reclen: u16 = file.decode()?;
-		let kind: u8 = file.decode()?;
-		let namelen: u8 = file.decode()?;
-		let name = &mut name[0..namelen.into()];
+		if ent.namelen < 1 {
+			log::error!(
+				"readdir_block({inr}): invalid namelen for inode {}",
+				ent.inr
+			);
+			break;
+		}
+		let namelen = ent.namelen as usize;
+		let name = &mut name[0..ent.namelen.into()];
 		file.read(name)?;
 
+		let nread = size_of_val(&ent) + namelen;
+
 		// skip remaining bytes of record, if any
-		let off = reclen - (namelen as u16) - 8;
-		file.seek_relative(off as i64)?;
+		let off = ent.reclen as i64 - nread as i64;
+		if off < 0 {
+			log::error!(
+				"readdir_block({inr}): invalid dirent for inode {}, reclen={}, namelen={namelen}, name={name:?}",
+				ent.inr, ent.reclen
+			);
+			break;
+		}
+		file.seek_relative(off)?;
 
 		let name = unsafe { OsStr::from_encoded_bytes_unchecked(name) };
-		let kind = match kind {
+		let kind = match ent.kind {
 			DT_FIFO => FileType::NamedPipe,
 			DT_CHR => FileType::CharDevice,
 			DT_DIR => FileType::Directory,
@@ -391,10 +404,10 @@ fn readdir_block<T>(
 				log::warn!("readdir_block({inr}): encountered a whiteout entry: {name:?}");
 				continue;
 			}
-			DT_UNKNOWN => todo!("DT_UNKNOWN: {ino}"),
-			_ => panic!("invalid filetype: {kind}"),
+			DT_UNKNOWN => todo!("DT_UNKNOWN: {}", ent.inr),
+			kind => panic!("invalid filetype: {kind}"),
 		};
-		let res = f(name, ino, kind);
+		let res = f(name, ent.inr, kind);
 		if res.is_some() {
 			return Ok(res);
 		}
